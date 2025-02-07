@@ -3337,6 +3337,12 @@ def make_image(
 
     logging.debug(json.dumps(output, indent=4))
 
+    if context.config.verity == Verity.defer:
+        for k in output:
+            if k['label'].endswith('_verity') and k['roothash'] != 'TBD':
+                (context.staging / f"{context.config.output_with_format[:-3]}roothash").write_text(k['roothash'])
+                break
+
     partitions = [Partition.from_dict(d) for d in output]
     arch = context.config.architecture
 
