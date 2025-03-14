@@ -1639,6 +1639,33 @@ def parse_chdir(path: str) -> Optional[Path]:
     return Path.cwd()
 
 
+class OBSDefaultAction(argparse.Action):
+    def __init__(
+        self,
+        option_strings: Sequence[str],
+        dest: str,
+        nargs: Union[int, str, None] = None,
+        default: Any = argparse.SUPPRESS,
+        help: Optional[str] = argparse.SUPPRESS,
+    ) -> None:
+        super().__init__(option_strings, dest, nargs=nargs, default=default, help=help)
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Union[str, Sequence[Any], None],
+        option_string: Optional[str] = None,
+    ) -> None:
+        if values and values.startswith("mkosi.obs"):
+            obs = Path("mkosi.obs")
+            lconf = Path("mkosi.local.conf")
+            obs.rename(lconf)
+            logging.info(f"moved {obs} to {lconf}")
+        else:
+            logging.warning(f"{option_string} is no longer supported")
+
+
 class IgnoreAction(argparse.Action):
     """Argparse action for deprecated options that can be ignored."""
 
@@ -4224,7 +4251,7 @@ def create_argument_parser(chdir: bool = True) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--default",
-        action=IgnoreAction,
+        action=OBSDefaultAction,
     )
     parser.add_argument(
         "--cache",
