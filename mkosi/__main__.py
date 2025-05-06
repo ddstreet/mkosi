@@ -35,7 +35,7 @@ def main() -> None:
     log_setup()
 
     with resource_path(mkosi.resources) as resources:
-        args, tools, images = parse_config(sys.argv[1:], resources=resources)
+        args, tools, images = parse_config(["--include", "mkosi-obs"] + sys.argv[1:], resources=resources)
 
         if args.debug:
             faulthandler.enable()
