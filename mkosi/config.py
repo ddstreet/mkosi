@@ -2546,6 +2546,18 @@ SETTINGS: list[ConfigSetting[Any]] = [
         help="Include configuration from the specified file or directory",
         tools=True,
     ),
+    ConfigSetting(
+        dest="include_last",
+        long="--include-last",
+        section="Include",
+        parse=config_make_list_parser(
+            delimiter=",",
+            reset=False,
+            parse=make_path_parser(constants=BUILTIN_CONFIGS),
+        ),
+        help="Include configuration from the specified file or directory, after all other configuration",
+        tools=True,
+    ),
     # Config section
     ConfigSetting(
         dest="profiles",
@@ -5152,6 +5164,11 @@ def parse_config(
     if configdir is not None:
         with chdir(configdir):
             context.parse_config_one(configdir, parse_profiles=True, parse_local=True)
+
+    # Parse any include-last configuration
+    if context.config.get("include_last"):
+        context.config["include"] = context.config.get("include", []) + context.config.get("include_last", [])
+        context.parse_new_includes()
 
     config = context.finalize()
 
