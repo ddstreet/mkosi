@@ -63,7 +63,7 @@ ConfigParseCallback = Callable[[Optional[str], Optional[T]], Optional[T]]
 ConfigMatchCallback = Callable[[str, T], bool]
 ConfigDefaultCallback = Callable[[dict[str, Any]], T]
 
-BUILTIN_CONFIGS = ("mkosi-tools", "mkosi-initrd", "mkosi-vm", "mkosi-addon", "mkosi-obs")
+BUILTIN_CONFIGS = ("mkosi-tools", "mkosi-initrd", "mkosi-vm", "mkosi-addon", "mkosi-obs", "mkosi-obs/include-last")
 
 
 class Verb(StrEnum):
@@ -4542,6 +4542,8 @@ class ParseContext:
         self.defaults: dict[str, Any] = {}
         # Compare inodes instead of paths so we can't get tricked by bind mounts and such.
         self.includes: set[tuple[int, int]] = set()
+        # Flag indicating if we're in the include-last parsing stage
+        self.should_parse_include_last = False
 
     def setting_prohibited(self, setting: ConfigSetting[T]) -> bool:
         image = self.config["image"]
@@ -4609,7 +4611,10 @@ class ParseContext:
 
     def parse_new_includes(self) -> None:
         # Parse any includes that were added after yielding.
-        for p in self.cli.get("include", []) + self.config.get("include", []):
+        paths = self.cli.get("include", []) + self.config.get("include", [])
+        if self.should_parse_include_last:
+            paths = paths + self.config.get("include_last", [])
+        for p in includes:
             for c in BUILTIN_CONFIGS:
                 if p == Path(c):
                     path = self.resources / c
@@ -5165,10 +5170,8 @@ def parse_config(
         with chdir(configdir):
             context.parse_config_one(configdir, parse_profiles=True, parse_local=True)
 
-    # Parse any include-last configuration
-    if context.config.get("include_last"):
-        context.config["include"] = context.config.get("include", []) + context.config.get("include_last", [])
-        context.parse_new_includes()
+    self.should_parse_include_last = True
+    context.parse_new_includes()
 
     config = context.finalize()
 
