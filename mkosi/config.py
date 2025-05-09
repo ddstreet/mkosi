@@ -10,6 +10,7 @@ import functools
 import getpass
 import graphlib
 import io
+import itertools
 import json
 import logging
 import math
@@ -25,7 +26,8 @@ import tempfile
 import textwrap
 import typing
 import uuid
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections import defaultdict
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Generic, Optional, Protocol, TypeVar, Union, cast
@@ -4236,6 +4238,7 @@ SPECIFIERS = (
     Specifier(
         char="D",
         callback=lambda ns, config: os.fspath(ns["directory"].resolve()),
+        depends=("directory",),
     ),
     Specifier(
         char="F",
@@ -4245,6 +4248,7 @@ SPECIFIERS = (
     Specifier(
         char="I",
         callback=lambda ns, config: ns["image"],
+        depends=("image",),
     ),
 )
 
@@ -4518,21 +4522,97 @@ class ConfigAction(argparse.Action):
             setattr(namespace, s.dest, parsed_value)
 
 
+class PriorityConfig(Mapping):
+    def __init__(self) -> None:
+        self._priorities: dict[int, dict[str, Any]] = {}
+
+    # All config values must be set on a specific priority returned from this method
+    def get_priority(self, priority: int) -> dict[str, Any]:
+        if priority not in self._priorities:
+            self._priorities[priority] = {}
+            # Priority levels are inverse, e.g. 1 is high priority and 100 is low priority
+            # This keeps our priorities sorted in low->high order
+            self._priorities = dict(reversed(sorted(self._priorities.items(), key=lambda i: i[0])))
+
+        return self._priorities[priority]
+
+    def __iter__(self) -> Iterable[ConfigSetting[T]]:
+        return set(itertools.chain.from_iterable(list(self._priorities)))
+
+    def __len__(self) -> int:
+        len(iter(self))
+
+    def __getitem__(self, setting: ConfigSetting[T]) -> Optional[T]:
+        value: Optional[T] = None
+        use_value: bool = False
+
+        # Iterate through all priorities (always ordered least->most) to merge values
+        for (p, v) in [(p, cast(Optional[T], p.get(setting.dest))) for p in self._priorities.values()]:
+            # Cleared in this priority
+            if p.get(f"{setting.dest}_was_none", False):
+                use_value = True
+                value = None
+
+            # Not set in current priority
+            if v is None:
+                continue
+
+            use_value = True
+
+            # Not set in previous priorities (or cleared in this one)
+            if value is None:
+                value = cast(Optional[T], v)
+                continue
+
+            assert type(value) == type(v)
+
+            if isinstance(value, list):
+                value = value + v
+            elif isinstance(value, (dict, set)):
+                value = value | v
+
+        return (value if use_value else self._default(setting))
+
+    def _default(self, setting: ConfigSetting[T]) -> Optional[T]:
+        if setting.default_factory:
+            return setting.default_factory(self)
+
+        if setting.default is not None:
+            return setting.default
+
+        if setting.parse:
+            return setting.parse(None, None)
+
+        return None
+
+
+# Lower number == higher priority
+PRIORITY_CLI: int = -10
+PRIORITY_LOCAL: int = 0
+PRIORITY_MIN: int = 1
+PRIORITY_DEFAULT: int = 100
+
+
 class ParseContext:
-    def __init__(self, resources: Path = Path("/")) -> None:
+    def __init__(
+        self,
+        resources: Path = Path("/"),
+        image: str = "main",
+        defaults: dict[str, Any] = {},
+    ) -> None:
         self.resources = resources
-        # We keep two namespaces around, one for the settings specified on the CLI and one for
-        # the settings specified in configuration files. This is required to implement both [Match]
-        # support and the behavior where settings specified on the CLI always override settings
-        # specified in configuration files.
-        self.cli: dict[str, Any] = {}
-        self.config: dict[str, Any] = {"files": []}
-        self.defaults: dict[str, Any] = {}
+        self.files: dict[int, list[str]] = defaultdict(list)
         # Compare inodes instead of paths so we can't get tricked by bind mounts and such.
         self.includes: set[tuple[int, int]] = set()
+        self.config = PriorityConfig()
+        self.config.get_priority(PRIORITY_DEFAULT).update(defaults)
+
+    @property
+    def cli(self) -> dict[str, Any]:
+        return self.config.get_priority(PRIORITY_CLI)
 
     def setting_prohibited(self, setting: ConfigSetting[T]) -> bool:
-        image = self.config["image"]
+        image = self.config.get("image")
 
         return (
             (not setting.tools and image == "tools")
@@ -4554,7 +4634,7 @@ class ParseContext:
                 if c == "%":
                     result += "%"
                 elif setting := SETTINGS_LOOKUP_BY_SPECIFIER.get(c):
-                    if (v := self.finalize_value(setting)) is None:
+                    if (v := self.config.get(setting)) is None:
                         logging.warning(
                             f"{path.absolute()}: Setting {setting.name} specified by specifier '%{c}' "
                             f"in {text} is not yet set, ignoring"
@@ -4563,26 +4643,17 @@ class ParseContext:
 
                     result += str(v)
                 elif specifier := SPECIFIERS_LOOKUP_BY_CHAR.get(c):
-                    # Some specifier methods might want to access the image name or directory mkosi was
-                    # invoked in so let's make sure those are available.
-                    specifierns = {
-                        "image": self.config["image"],
-                        "directory": self.config["directory"],
-                    }
-
                     for d in specifier.depends:
                         setting = SETTINGS_LOOKUP_BY_DEST[d]
-
-                        if (v := self.finalize_value(setting)) is None:
+                        if self.config.get(setting) is None:
                             logging.warning(
                                 f"{path.absolute()}: Setting {setting.name} which specifier '%{c}' in "
                                 f"{text} depends on is not yet set, ignoring"
                             )
                             break
 
-                        specifierns[d] = v
                     else:
-                        result += specifier.callback(specifierns, path)
+                        result += specifier.callback(self.config, path)
                 else:
                     logging.warning(f"{path.absolute()}: Unknown specifier '%{c}' found in {text}, ignoring")
             elif c == "%":
@@ -4597,7 +4668,7 @@ class ParseContext:
 
     def parse_new_includes(self) -> None:
         # Parse any includes that were added after yielding.
-        for p in self.cli.get("include", []) + self.config.get("include", []):
+        for p in self.config.get("include", []):
             for c in BUILTIN_CONFIGS:
                 if p == Path(c):
                     path = self.resources / c
@@ -4613,15 +4684,12 @@ class ParseContext:
             self.includes.add((st.st_dev, st.st_ino))
 
             if any(p == Path(c) for c in BUILTIN_CONFIGS):
-                context = ParseContext(self.resources)
-
-                context.config["image"] = "main"
-                context.config["directory"] = path
+                context = ParseContext(self.resources, {"image": "main", "directory": path})
 
                 with chdir(path):
                     context.parse_config_one(path)
 
-                config = Config.from_dict(context.finalize())
+                config = Config.from_dict(context.configs)
 
                 make_executable(
                     *config.configure_scripts,
@@ -4636,85 +4704,6 @@ class ParseContext:
 
             with chdir(path if path.is_dir() else Path.cwd()):
                 self.parse_config_one(path if path.is_file() else Path.cwd(), parse_profiles=path.is_dir())
-
-    def finalize_value(self, setting: ConfigSetting[T]) -> Optional[T]:
-        # If a value was specified on the CLI, it always takes priority. If the setting is a collection of
-        # values, we merge the value from the CLI with the value from the configuration, making sure that the
-        # value from the CLI always takes priority.
-        if (v := cast(Optional[T], self.cli.get(setting.dest))) is not None:
-            cfg_value = self.config.get(setting.dest)
-            # We either have no corresponding value in the config files
-            # or the values was assigned the empty string on the CLI
-            # and should thus be treated as a reset and override of the value from the config file.
-            if cfg_value is None or self.cli.get(f"{setting.dest}_was_none", False):
-                return v
-
-            # The instance asserts are pushed down to help mypy/pylance narrow the types.
-            # Mypy still cannot properly infer that the merged collections conform to T
-            # so we ignore the return-value error for it.
-            if isinstance(v, list):
-                assert isinstance(cfg_value, type(v))
-                return cfg_value + v  # type: ignore[return-value]
-            elif isinstance(v, dict):
-                assert isinstance(cfg_value, type(v))
-                return cfg_value | v  # type: ignore[return-value]
-            elif isinstance(v, set):
-                assert isinstance(cfg_value, type(v))
-                return cfg_value | v  # type: ignore[return-value]
-            else:
-                return v
-
-        # If the setting was assigned the empty string on the CLI, we don't use any value configured in the
-        # configuration file. Additionally, if the setting is a collection of values, we won't use any
-        # default value either if the setting is set to the empty string on the command line.
-
-        if (
-            setting.dest not in self.cli
-            and setting.dest in self.config
-            and (v := cast(Optional[T], self.config[setting.dest])) is not None
-        ):
-            return v
-
-        # If the type is a collection or optional and the setting was set explicitly, don't use the default
-        # value.
-        fieldname = (
-            setting.dest.removeprefix("tools_tree_") if setting.scope == SettingScope.tools else setting.dest
-        )
-        field = Config.fields().get(fieldname)
-        origin = typing.get_origin(field.type) if field else None
-        args = typing.get_args(field.type) if field else []
-        if (
-            (setting.dest in self.cli or setting.dest in self.config)
-            and field
-            and (origin in (dict, list, str) or (origin is typing.Union and type(None) in args))
-        ):
-            default = setting.parse(None, None)
-        elif setting.dest in self.defaults:
-            default = self.defaults[setting.dest]
-        elif setting.default_factory:
-            # Some default factory methods want to access the image name or directory mkosi was invoked in so
-            # let's make sure those are available.
-            factoryns = {
-                "image": self.config["image"],
-                "directory": self.config["directory"],
-            }
-
-            # To determine default values, we need the final values of various settings in a namespace
-            # object, but we don't want to copy the final values into the config namespace object just yet so
-            # we create a new namespace object instead.
-            factoryns |= {
-                d: self.finalize_value(SETTINGS_LOOKUP_BY_DEST[d]) for d in setting.default_factory_depends
-            }
-
-            default = setting.default_factory(factoryns)
-        elif setting.default is not None:
-            default = setting.default
-        else:
-            default = setting.parse(None, None)
-
-        self.defaults[setting.dest] = default
-
-        return default
 
     def match_config(self, path: Path) -> bool:
         condition_triggered: Optional[bool] = None
@@ -4752,7 +4741,7 @@ class ParseContext:
                 if not s.match:
                     die(f"{path.absolute()}: {k} cannot be used in [{section}]")
 
-                if s.scope == SettingScope.main and self.config["image"] != "main":
+                if s.scope == SettingScope.main and self.config.get("image") != "main":
                     die(f"{path.absolute()}: {k} cannot be matched on outside of the main image")
 
                 if k != s.name:
@@ -4760,15 +4749,13 @@ class ParseContext:
                         f"{path.absolute()}: Setting {k} is deprecated, please use {s.name} instead."
                     )
 
-                # If we encounter a setting that has not been explicitly configured yet, we assign the
-                # default value first so that we can match on default values for settings.
-                if (value := self.finalize_value(s)) is None:
+                if (value := self.config.get(s)) is None:
                     result = False
                 else:
                     result = s.match(v, value)
 
             elif m := MATCH_LOOKUP.get(k):
-                result = m.match(self.config["image"], v)
+                result = m.match(self.config.get("image"), v)
             else:
                 die(f"{path.absolute()}: {k} cannot be used in [{section}]")
 
@@ -4786,7 +4773,29 @@ class ParseContext:
 
         return match_triggered is not False
 
-    def parse_config_one(self, path: Path, parse_profiles: bool = False, parse_local: bool = False) -> bool:
+    def parse_priority(self, path: Path, old: int) -> int:
+        if not path.exists():
+            return old
+
+        new: int = old
+        for _, k, v in parse_ini(path, only_sections={"Config"},):
+            if k != "Priority":
+                continue
+            try:
+                v = int(v)
+            except ValueError:
+                logging.warning(f"{path.absolute()}: Priority= '{v}' is not number, ignoring")
+                continue
+            if old == PRIORITY_LOCAL:
+                logging.warning(f"{path.absolute()}: Priority= cannot be set in {path.name}, ignoring")
+            elif v < PRIORITY_MIN:
+                logging.warning(f"{path.absolute()}: Priority= {v} below minimum {PRIORITY_MIN}, ignoring")
+            else:
+                new = v
+
+        return new
+
+    def parse_config_one(self, path: Path, priority: int = PRIORITY_DEFAULT, parse_profiles: bool = False, parse_local: bool = False) -> bool:
         s: Optional[ConfigSetting[object]]  # Hint to mypy that we might assign None
         assert path.is_absolute()
 
@@ -4797,6 +4806,10 @@ class ParseContext:
         if not self.match_config(path):
             return False
 
+        priority = self.parse_priority(path, priority)
+        config = self.config.get_priority(priority)
+        files = self.files[priority]
+
         if extras:
             if parse_local:
                 for localpath in (
@@ -4804,15 +4817,7 @@ class ParseContext:
                     *([p] if (p := path.parent / "mkosi.local.conf").is_file() else []),
                 ):
                     with chdir(localpath if localpath.is_dir() else Path.cwd()):
-                        self.parse_config_one(localpath if localpath.is_file() else Path.cwd())
-
-                    # Local configuration should override other file based
-                    # configuration but not the CLI itself so move the finalized
-                    # values to the CLI namespace.
-                    for s in SETTINGS:
-                        if s.dest in self.config:
-                            self.cli[s.dest] = self.finalize_value(s)
-                            del self.config[s.dest]
+                        self.parse_config_one(localpath if localpath.is_file() else Path.cwd(), priority=PRIORITY_LOCAL)
 
             for s in SETTINGS:
                 image = self.config["image"]
@@ -4832,9 +4837,9 @@ class ParseContext:
                         expandvars=False,
                     )
                     if extra.exists():
-                        self.config[s.dest] = s.parse(
+                        config[s.dest] = s.parse(
                             file_run_or_read(extra).rstrip("\n") if s.path_read_text else f,
-                            self.config.get(s.dest),
+                            config.get(s.dest, None),
                         )
 
                 for f in s.recursive_path_suffixes:
@@ -4850,11 +4855,10 @@ class ParseContext:
                     )
                     for e in recursive_extras:
                         if e.exists():
-                            self.config[s.dest] = s.parse(os.fspath(e), self.config.get(s.dest))
+                            config[s.dest] = s.parse(os.fspath(e), config.get(s.dest, None))
 
         if path.exists():
-            logging.debug(f"Loading configuration file {path}")
-            files = self.config["files"]
+            logging.debug(f"Loading configuration file {path} at priority {priority}")
             files += [path]
 
             for section, k, v in parse_ini(
@@ -4874,7 +4878,7 @@ class ParseContext:
                 if not (s := SETTINGS_LOOKUP_BY_NAME.get(name)):
                     die(f"{path.absolute()}: Unknown setting {name}")
 
-                image = self.config["image"]
+                image = self.config.get("image")
 
                 if self.setting_prohibited(s):
                     die(f"{path.absolute()}: Setting {name} cannot be configured in {image} image")
@@ -4892,7 +4896,7 @@ class ParseContext:
 
                 v = self.expand_specifiers(v, path)
 
-                self.config[s.dest] = s.parse(v, self.config.get(s.dest))
+                config[s.dest] = s.parse(v, config.get(s.dest))
                 self.parse_new_includes()
 
         if extras and (path.parent / "mkosi.conf.d").exists():
@@ -4904,7 +4908,7 @@ class ParseContext:
                         self.parse_config_one(p if p.is_file() else Path.cwd())
 
         if parse_profiles:
-            for profile in self.finalize_value(SETTINGS_LOOKUP_BY_DEST["profiles"]) or []:
+            for profile in self.config.get(SETTINGS_LOOKUP_BY_DEST["profiles"]) or []:
                 for p in (Path(profile), Path(f"{profile}.conf")):
                     p = Path.cwd() / "mkosi.profiles" / p
                     if p.exists():
@@ -4914,15 +4918,7 @@ class ParseContext:
         return True
 
     def finalize(self) -> dict[str, Any]:
-        ns = copy.deepcopy(self.config)
-
-        # After we've finished parsing the configuration, we'll have values in both namespaces (context.cli,
-        # context.config). To be able to parse the values from a single namespace, we merge the final values
-        # of each setting into one namespace.
-        for s in SETTINGS:
-            ns[s.dest] = copy.deepcopy(self.finalize_value(s))
-
-        return ns
+        return copy.deepcopy(self.config)
 
 
 def want_new_history(args: Args) -> bool:
@@ -4973,7 +4969,8 @@ def finalize_default_tools(
     configdir: Optional[Path],
     resources: Path,
 ) -> Config:
-    context = ParseContext(resources)
+    context = ParseContext(resources, "tools")
+    config = context.get_priority(PRIORITY_DEFAULT)
 
     for s in SETTINGS:
         if s.scope == SettingScope.multiversal:
@@ -4987,22 +4984,19 @@ def finalize_default_tools(
                 ns = context.cli
                 if f"{s.dest}_was_none" in main.cli:
                     ns[f"{dest}_was_none"] = main.cli[f"{s.dest}_was_none"]
-            elif s.dest in main.config:
-                ns = context.config
             else:
-                ns = context.defaults
+                ns = config
 
             ns[dest] = copy.deepcopy(finalized[s.dest])
 
     context.cli["output_format"] = OutputFormat.directory
 
-    context.config |= {
-        "image": "tools",
+    config |= {
         "directory": finalized["directory"],
         "files": [],
     }
 
-    context.config["environment"] = {
+    config["environment"] = {
         name: finalized["environment"][name]
         for name in finalized.get("environment", {}).keys() & finalized.get("pass_environment", [])
     }
@@ -5070,10 +5064,6 @@ def parse_config(
     argv = list(argv)
 
     context = ParseContext(resources)
-
-    # The "image" field does not directly map to a setting but is required to determine some default values
-    # for settings, so let's set it on the config namespace immediately so it's available.
-    context.config["image"] = "main"
 
     # First, we parse the command line arguments into a separate namespace.
     argparser = create_argument_parser()
