@@ -4635,7 +4635,10 @@ class ParseContext:
                 )
 
             with chdir(path if path.is_dir() else Path.cwd()):
-                self.parse_config_one(path if path.is_file() else Path.cwd(), parse_profiles=path.is_dir())
+                self.parse_config_one(
+                    path if path.is_file() else Path.cwd(),
+                    parse_profiles=path.is_dir(),
+                    from_cli=p in self.cli.get("include", []))
 
     def finalize_value(self, setting: ConfigSetting[T]) -> Optional[T]:
         # If a value was specified on the CLI, it always takes priority. If the setting is a collection of
@@ -4786,7 +4789,13 @@ class ParseContext:
 
         return match_triggered is not False
 
-    def parse_config_one(self, path: Path, parse_profiles: bool = False, parse_local: bool = False) -> bool:
+    def parse_config_one(
+        self,
+        path: Path,
+        parse_profiles: bool = False,
+        parse_local: bool = False,
+        from_cli: bool = False
+    ) -> bool:
         s: Optional[ConfigSetting[object]]  # Hint to mypy that we might assign None
         assert path.is_absolute()
 
@@ -4820,6 +4829,8 @@ class ParseContext:
                 if self.setting_prohibited(s):
                     continue
 
+                config = self.cli if from_cli else self.config
+
                 for f in s.path_suffixes:
                     f = f"mkosi.{f}"
 
@@ -4832,9 +4843,9 @@ class ParseContext:
                         expandvars=False,
                     )
                     if extra.exists():
-                        self.config[s.dest] = s.parse(
+                        config[s.dest] = s.parse(
                             file_run_or_read(extra).rstrip("\n") if s.path_read_text else f,
-                            self.config.get(s.dest),
+                            config.get(s.dest),
                         )
 
                 for f in s.recursive_path_suffixes:
@@ -4850,7 +4861,7 @@ class ParseContext:
                     )
                     for e in recursive_extras:
                         if e.exists():
-                            self.config[s.dest] = s.parse(os.fspath(e), self.config.get(s.dest))
+                            config[s.dest] = s.parse(os.fspath(e), config.get(s.dest))
 
         if path.exists():
             logging.debug(f"Loading configuration file {path}")
@@ -4892,7 +4903,10 @@ class ParseContext:
 
                 v = self.expand_specifiers(v, path)
 
-                self.config[s.dest] = s.parse(v, self.config.get(s.dest))
+                if from_cli:
+                    self.cli[s.dest] = s.parse(v, self.cli.get(s.dest))
+                else:
+                    self.config[s.dest] = s.parse(v, self.config.get(s.dest))
                 self.parse_new_includes()
 
         if extras and (path.parent / "mkosi.conf.d").exists():
@@ -4901,7 +4915,7 @@ class ParseContext:
 
                 if p.is_dir() or p.suffix == ".conf":
                     with chdir(p if p.is_dir() else Path.cwd()):
-                        self.parse_config_one(p if p.is_file() else Path.cwd())
+                        self.parse_config_one(p if p.is_file() else Path.cwd(), from_cli=from_cli)
 
         if parse_profiles:
             for profile in self.finalize_value(SETTINGS_LOOKUP_BY_DEST["profiles"]) or []:
@@ -4909,7 +4923,7 @@ class ParseContext:
                     p = Path.cwd() / "mkosi.profiles" / p
                     if p.exists():
                         with chdir(p if p.is_dir() else Path.cwd()):
-                            self.parse_config_one(p if p.is_file() else Path.cwd())
+                            self.parse_config_one(p if p.is_file() else Path.cwd(), from_cli=from_cli)
 
         return True
 
